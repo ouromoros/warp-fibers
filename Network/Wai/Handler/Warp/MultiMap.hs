@@ -71,8 +71,8 @@ toList m = concatMap f $ I.toAscList m
 
 -- | O(n)
 pruneWith :: MMap v
-          -> (v -> IO Bool)
-          -> IO (MMap v)
+          -> (v -> Fiber Bool)
+          -> Fiber (MMap v)
 pruneWith m action = I.fromAscList <$> go (I.toDescList m) []
   where
     go []          acc = return acc
@@ -90,7 +90,7 @@ merge m1 m2 = I.unionWith (<>) m1 m2
 
 ----------------------------------------------------------------
 
-prune :: (a -> IO Bool) -> NonEmpty a -> IO (Maybe (NonEmpty a))
+prune :: (a -> Fiber Bool) -> NonEmpty a -> Fiber (Maybe (NonEmpty a))
 prune act nxs = NE.nonEmpty <$> go (NE.toList nxs)
   where
     go []     = return []

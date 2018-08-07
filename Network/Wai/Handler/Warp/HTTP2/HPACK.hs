@@ -10,7 +10,8 @@ module Network.Wai.Handler.Warp.HTTP2.HPACK (
   , addHeader -- testing
   ) where
 
-import qualified Control.Exception as E
+import qualified Control.Concurrent.Fiber.Exception as E
+import qualified Control.Exception as IE
 import Network.HPACK hiding (Buffer)
 import Network.HPACK.Token
 import Network.HTTP2
@@ -39,7 +40,7 @@ addNecessaryHeaders :: Context
                     -> Rspn
                     -> InternalInfo
                     -> S.Settings
-                    -> IO TokenHeaderList
+                    -> Fiber TokenHeaderList
 addNecessaryHeaders Context{..} rspn ii settings = do
     date <- getDate ii
     let !s = rspnStatus rspn
@@ -60,29 +61,29 @@ strategy = EncodeStrategy { compressionAlgo = Linear, useHuffman = False }
 -- So, we don't need to split it.
 hpackEncodeHeader :: Context -> Buffer -> BufSize
                   -> TokenHeaderList
-                  -> IO (TokenHeaderList, Int)
+                  -> Fiber (TokenHeaderList, Int)
 hpackEncodeHeader Context{..} buf siz ths =
-    encodeTokenHeader buf siz strategy True encodeDynamicTable ths
+    liftIO $ encodeTokenHeader buf siz strategy True encodeDynamicTable ths
 
 hpackEncodeHeaderLoop :: Context -> Buffer -> BufSize
                       -> TokenHeaderList
-                      -> IO (TokenHeaderList, Int)
+                      -> Fiber (TokenHeaderList, Int)
 hpackEncodeHeaderLoop Context{..} buf siz hs =
-    encodeTokenHeader buf siz strategy False encodeDynamicTable hs
+    liftIO $ encodeTokenHeader buf siz strategy False encodeDynamicTable hs
 
 ----------------------------------------------------------------
 
-hpackDecodeHeader :: HeaderBlockFragment -> Context -> IO (TokenHeaderList, ValueTable)
-hpackDecodeHeader hdrblk Context{..} = do
-    tbl@(_,vt) <- decodeTokenHeader decodeDynamicTable hdrblk `E.catch` handl
+hpackDecodeHeader :: HeaderBlockFragment -> Context -> Fiber (TokenHeaderList, ValueTable)
+hpackDecodeHeader hdrblk Context{..} = liftIO $ do
+    tbl@(_,vt) <- decodeTokenHeader decodeDynamicTable hdrblk `IE.catch` handl
     unless (checkRequestHeader vt) $
-        E.throwIO $ ConnectionError ProtocolError "the header key is illegal"
+        IE.throwIO $ ConnectionError ProtocolError "the header key is illegal"
     return tbl
   where
     handl IllegalHeaderName =
-        E.throwIO $ ConnectionError ProtocolError "the header key is illegal"
+        IE.throwIO $ ConnectionError ProtocolError "the header key is illegal"
     handl _ =
-        E.throwIO $ ConnectionError CompressionError "cannot decompress the header"
+        IE.throwIO $ ConnectionError CompressionError "cannot decompress the header"
 
 {-# INLINE checkRequestHeader #-}
 checkRequestHeader :: ValueTable -> Bool

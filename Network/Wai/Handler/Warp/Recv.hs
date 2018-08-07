@@ -9,31 +9,36 @@ module Network.Wai.Handler.Warp.Recv (
   , spell
   ) where
 
-import qualified Control.Exception as E
+import qualified Control.Concurrent.Fiber.Exception as E
+import qualified Control.Exception as IE
 import qualified Data.ByteString as BS
 import Data.IORef
 import Foreign.C.Error (eAGAIN, getErrno, throwErrno)
 import Foreign.C.Types
-import Foreign.ForeignPtr (withForeignPtr)
+-- import Foreign.ForeignPtr (withForeignPtr)
+import Control.Concurrent.Fiber.Network.Internal1 (withForeignPtr)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
-import GHC.Conc (threadWaitRead)
-import Network.Socket (Socket, fdSocket)
-import System.Posix.Types (Fd(..))
+-- import GHC.Conc (threadWaitRead)
+-- import Control.Concurrent.Fiber.Network.Internal (threadWaitRead)
+-- import Network.Socket (Socket, fdSocket)
+import Control.Concurrent.Fiber.Network (Socket)
 
 import Network.Wai.Handler.Warp.Buffer
 import Network.Wai.Handler.Warp.Imports
 import Network.Wai.Handler.Warp.Types
 
-#ifdef mingw32_HOST_OS
-import GHC.IO.FD (FD(..), readRawBufferPtr)
-import Network.Wai.Handler.Warp.Windows
-#endif
+-- #ifdef mingw32_HOST_OS
+-- import GHC.IO.FD (FD(..), FDType(..))
+import System.Posix.Types (Channel)
+import Control.Concurrent.Fiber.Network (recvBuf)
+-- import Network.Wai.Handler.Warp.Windows
+-- #endif
 
 ----------------------------------------------------------------
 
-makeReceiveN :: ByteString -> Recv -> RecvBuf -> IO (BufSize -> IO ByteString)
+makeReceiveN :: ByteString -> Recv -> RecvBuf -> Fiber (BufSize -> Fiber ByteString)
 makeReceiveN bs0 recv recvBuf = do
-    ref <- newIORef bs0
+    ref <- liftIO $ newIORef bs0
     return $ receiveN ref recv recvBuf
 
 -- | This function returns a receiving function
@@ -41,25 +46,25 @@ makeReceiveN bs0 recv recvBuf = do
 --   The returned function efficiently manages received data
 --   which is initialized by the first argument.
 --   The returned function may allocate a byte string with malloc().
-makePlainReceiveN :: Socket -> ByteString -> IO (BufSize -> IO ByteString)
+makePlainReceiveN :: Socket -> ByteString -> Fiber (BufSize -> Fiber ByteString)
 makePlainReceiveN s bs0 = do
-    ref <- newIORef bs0
+    ref <- liftIO $ newIORef bs0
     pool <- newBufferPool
     return $ receiveN ref (receive s pool) (receiveBuf s)
 
-receiveN :: IORef ByteString -> Recv -> RecvBuf -> BufSize -> IO ByteString
-receiveN ref recv recvBuf size = E.handle handler $ do
-    cached <- readIORef ref
+receiveN :: IORef ByteString -> Recv -> RecvBuf -> BufSize -> Fiber ByteString
+receiveN ref recv recvBuf size = E.handle (liftIO . handler) $ do
+    cached <- liftIO $ readIORef ref
     (bs, leftover) <- spell cached size recv recvBuf
-    writeIORef ref leftover
+    liftIO $ writeIORef ref leftover
     return bs
  where
-   handler :: E.SomeException -> IO ByteString
+   handler :: IE.SomeException -> IO ByteString
    handler _ = return ""
 
 ----------------------------------------------------------------
 
-spell :: ByteString -> BufSize -> IO ByteString -> RecvBuf -> IO (ByteString, ByteString)
+spell :: ByteString -> BufSize -> Fiber ByteString -> RecvBuf -> Fiber (ByteString, ByteString)
 spell init0 siz0 recv recvBuf
   | siz0 <= len0 = return $ BS.splitAt siz0 init0
   -- fixme: hard coding 4096
@@ -91,40 +96,36 @@ spell init0 siz0 recv recvBuf
 
 receive :: Socket -> BufferPool -> Recv
 receive sock pool = withBufferPool pool $ \ (ptr, size) -> do
-    let sock' = fdSocket sock
-        size' = fromIntegral size
-    fromIntegral <$> receiveloop sock' ptr size'
+    let size' = fromIntegral size
+    fromIntegral <$> recvBuf sock ptr size'
 
 receiveBuf :: Socket -> RecvBuf
 receiveBuf sock buf0 siz0 = loop buf0 siz0
   where
     loop _   0   = return True
     loop buf siz = do
-        n <- fromIntegral <$> receiveloop fd buf (fromIntegral siz)
+        n <- fromIntegral <$> recvBuf sock buf (fromIntegral siz)
         -- fixme: what should we do in the case of n == 0
         if n == 0 then
             return False
           else
             loop (buf `plusPtr` n) (siz - n)
-    fd = fdSocket sock
+    -- fd = fdSocket sock
 
-receiveloop :: CInt -> Ptr Word8 -> CSize -> IO CInt
-receiveloop sock ptr size = do
-#ifdef mingw32_HOST_OS
-    bytes <- windowsThreadBlockHack $ fromIntegral <$> readRawBufferPtr "recv" (FD sock 1) (castPtr ptr) 0 size
-#else
-    bytes <- c_recv sock (castPtr ptr) size 0
-#endif
-    if bytes == -1 then do
-        errno <- getErrno
-        if errno == eAGAIN then do
-            threadWaitRead (Fd sock)
-            receiveloop sock ptr size
-          else
-            throwErrno "receiveloop"
-       else
-        return bytes
+-- receiveloop :: Channel -> Ptr Word8 -> CSize -> Fiber CInt
+-- -- receiveloop = undefined
+-- receiveloop sock ptr size = do
+--     bytes <- fromIntegral <$> readRawBufferPtr "recv" (FD (FDGeneric sock) True)(castPtr ptr) 0 size
+--     if bytes == -1 then do
+--         errno <- liftIO getErrno
+--         if errno == eAGAIN then do
+--             threadWaitRead sock
+--             receiveloop sock ptr size
+--           else
+--             liftIO $ throwErrno "receiveloop"
+--        else
+--         return bytes
 
 -- fixme: the type of the return value
-foreign import ccall unsafe "recv"
-    c_recv :: CInt -> Ptr CChar -> CSize -> CInt -> IO CInt
+-- foreign import ccall unsafe "recv"
+--     c_recv :: CInt -> Ptr CChar -> CSize -> CInt -> IO CInt

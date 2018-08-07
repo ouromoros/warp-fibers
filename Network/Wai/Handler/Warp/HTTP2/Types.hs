@@ -4,9 +4,10 @@
 
 module Network.Wai.Handler.Warp.HTTP2.Types where
 
-import Control.Concurrent (forkIO)
+-- import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, bracket)
+import Control.Concurrent.Fiber.Exception (bracket)
+import Control.Exception (SomeException)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import Data.IORef
@@ -16,7 +17,7 @@ import Network.HPACK hiding (Buffer)
 import qualified Network.HTTP.Types as H
 import Network.HTTP2
 import Network.HTTP2.Priority
-import Network.Wai (Request, FilePart)
+import Network.Wai (FilePart)
 
 import Network.Wai.Handler.Warp.HTTP2.Manager
 import Network.Wai.Handler.Warp.Imports
@@ -41,7 +42,7 @@ data Input = Input Stream Request ValueTable InternalInfo
 
 ----------------------------------------------------------------
 
-type DynaNext = Buffer -> BufSize -> WindowSize -> IO Next
+type DynaNext = Buffer -> BufSize -> WindowSize -> Fiber Next
 
 type BytesFilled = Int
 
@@ -68,8 +69,8 @@ data Output = Output {
     outputStream :: !Stream
   , outputRspn   :: !Rspn
   , outputII     :: !InternalInfo
-  , outputHook   :: IO () -- OPush: wait for done, O*: telling done
-  , outputH2Data :: IO (Maybe HTTP2Data)
+  , outputHook   :: Fiber () -- OPush: wait for done, O*: telling done
+  , outputH2Data :: Fiber (Maybe HTTP2Data)
   , outputType   :: !OutputType
   }
 
@@ -122,8 +123,8 @@ data Context = Context {
 
 ----------------------------------------------------------------
 
-newContext :: IO Context
-newContext = Context <$> newIORef defaultSettings
+newContext :: Fiber Context
+newContext = liftIO $ Context <$> newIORef defaultSettings
                      <*> newIORef False
                      <*> newStreamTable
                      <*> newIORef 0
@@ -138,7 +139,7 @@ newContext = Context <$> newIORef defaultSettings
                      <*> newDynamicTableForDecoding defaultDynamicTableSize 4096
                      <*> newTVarIO defaultInitialWindowSize
 
-clearContext :: Context -> IO ()
+clearContext :: Context -> Fiber ()
 clearContext _ctx = return ()
 
 ----------------------------------------------------------------
@@ -205,13 +206,13 @@ data Stream = Stream {
 instance Show Stream where
   show s = show (streamNumber s)
 
-newStream :: StreamId -> WindowSize -> IO Stream
-newStream sid win = Stream sid <$> newIORef Idle
+newStream :: StreamId -> WindowSize -> Fiber Stream
+newStream sid win = liftIO $ Stream sid <$> newIORef Idle
                                <*> newTVarIO win
                                <*> newIORef defaultPrecedence
 
-newPushStream :: Context -> WindowSize -> Precedence -> IO Stream
-newPushStream Context{serverStreamId} win pre = do
+newPushStream :: Context -> WindowSize -> Precedence -> Fiber Stream
+newPushStream Context{serverStreamId} win pre = liftIO $ do
     sid <- atomicModifyIORef' serverStreamId inc2
     Stream sid <$> newIORef Reserved
                <*> newTVarIO win
@@ -221,16 +222,16 @@ newPushStream Context{serverStreamId} win pre = do
 
 ----------------------------------------------------------------
 
-opened :: Context -> Stream -> IO ()
-opened Context{concurrency} Stream{streamState} = do
+opened :: Context -> Stream -> Fiber ()
+opened Context{concurrency} Stream{streamState} = liftIO $ do
     atomicModifyIORef' concurrency (\x -> (x+1,()))
     writeIORef streamState (Open JustOpened)
 
-closed :: Context -> Stream -> ClosedCode -> IO ()
+closed :: Context -> Stream -> ClosedCode -> Fiber ()
 closed Context{concurrency,streamTable} Stream{streamState,streamNumber} cc = do
     remove streamTable streamNumber
-    atomicModifyIORef' concurrency (\x -> (x-1,()))
-    writeIORef streamState (Closed cc) -- anyway
+    liftIO $ atomicModifyIORef' concurrency (\x -> (x-1,()))
+    liftIO $ writeIORef streamState (Closed cc) -- anyway
 
 ----------------------------------------------------------------
 
@@ -239,28 +240,28 @@ newtype StreamTable = StreamTable (IORef (IntMap Stream))
 newStreamTable :: IO StreamTable
 newStreamTable = StreamTable <$> newIORef M.empty
 
-insert :: StreamTable -> M.Key -> Stream -> IO ()
-insert (StreamTable ref) k v = atomicModifyIORef' ref $ \m ->
+insert :: StreamTable -> M.Key -> Stream -> Fiber ()
+insert (StreamTable ref) k v = liftIO $ atomicModifyIORef' ref $ \m ->
     let !m' = M.insert k v m
     in (m', ())
 
-remove :: StreamTable -> M.Key -> IO ()
-remove (StreamTable ref) k = atomicModifyIORef' ref $ \m ->
+remove :: StreamTable -> M.Key -> Fiber ()
+remove (StreamTable ref) k = liftIO $ atomicModifyIORef' ref $ \m ->
     let !m' = M.delete k m
     in (m', ())
 
-search :: StreamTable -> M.Key -> IO (Maybe Stream)
-search (StreamTable ref) k = M.lookup k <$> readIORef ref
+search :: StreamTable -> M.Key -> Fiber (Maybe Stream)
+search (StreamTable ref) k = liftIO $ M.lookup k <$> readIORef ref
 
-updateAllStreamWindow :: (WindowSize -> WindowSize) -> StreamTable -> IO ()
-updateAllStreamWindow adst (StreamTable ref) = do
+updateAllStreamWindow :: (WindowSize -> WindowSize) -> StreamTable -> Fiber ()
+updateAllStreamWindow adst (StreamTable ref) = liftIO $ do
     strms <- M.elems <$> readIORef ref
     forM_ strms $ \strm -> atomically $ modifyTVar (streamWindow strm) adst
 
 {-# INLINE forkAndEnqueueWhenReady #-}
-forkAndEnqueueWhenReady :: IO () -> PriorityTree Output -> Output -> Manager -> IO ()
+forkAndEnqueueWhenReady :: Fiber () -> PriorityTree Output -> Output -> Manager -> Fiber ()
 forkAndEnqueueWhenReady wait outQ out mgr = bracket setup teardown $ \_ ->
-    void . forkIO $ do
+    void . forkFiber $ do
         wait
         enqueueOutput outQ out
   where
@@ -268,15 +269,15 @@ forkAndEnqueueWhenReady wait outQ out mgr = bracket setup teardown $ \_ ->
     teardown _ = deleteMyId mgr
 
 {-# INLINE enqueueOutput #-}
-enqueueOutput :: PriorityTree Output -> Output -> IO ()
+enqueueOutput :: PriorityTree Output -> Output -> Fiber ()
 enqueueOutput outQ out = do
     let Stream{..} = outputStream out
-    pre <- readIORef streamPrecedence
-    enqueue outQ streamNumber pre out
+    pre <- liftIO $ readIORef streamPrecedence
+    liftIO $ enqueue outQ streamNumber pre out
 
 {-# INLINE enqueueControl #-}
-enqueueControl :: TQueue Control -> Control -> IO ()
-enqueueControl ctlQ ctl = atomically $ writeTQueue ctlQ ctl
+enqueueControl :: TQueue Control -> Control -> Fiber ()
+enqueueControl ctlQ ctl = liftIO $ atomically $ writeTQueue ctlQ ctl
 
 ----------------------------------------------------------------
 

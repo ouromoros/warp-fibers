@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, CPP #-}
+{-# LANGUAGE RecordWildCards, CPP, DoAndIfThenElse, ForeignFunctionInterface #-}
 
 module Network.Wai.Handler.Warp.FileInfoCache (
     FileInfo(..)
@@ -8,13 +8,20 @@ module Network.Wai.Handler.Warp.FileInfoCache (
   ) where
 
 import Control.Exception as E
+import qualified Control.Concurrent.Fiber.Exception as FE
 import Control.Reaper
 import Network.HTTP.Date
-import System.PosixCompat.Files
+-- import System.PosixCompat.Files
 
 import Network.Wai.Handler.Warp.HashMap (HashMap)
 import qualified Network.Wai.Handler.Warp.HashMap as M
 import Network.Wai.Handler.Warp.Imports
+#ifdef INTEROP
+import qualified Interop.Java.IO as JIO
+#else
+import qualified Java.IO as JIO
+#endif
+import Java
 
 ----------------------------------------------------------------
 
@@ -34,43 +41,51 @@ type FileInfoCache = Reaper Cache (Int,FilePath,Entry)
 
 ----------------------------------------------------------------
 
--- | Getting the file information corresponding to the file.
-getInfo :: FilePath -> IO FileInfo
-getInfo path = do
-    fs <- getFileStatus path -- file access
-    let regular = not (isDirectory fs)
-        readable = fileMode fs `intersectFileModes` ownerReadMode /= 0
-    if regular && readable then do
-        let time = epochTimeToHTTPDate $ modificationTime fs
-            date = formatHTTPDate time
-            size = fromIntegral $ fileSize fs
-            info = FileInfo {
-                fileInfoName = path
-              , fileInfoSize = size
-              , fileInfoTime = time
-              , fileInfoDate = date
-              }
-        return info
-      else
-        throwIO (userError "FileInfoCache:getInfo")
+foreign import java unsafe "@new" newFile :: String -> Java a JIO.File
+-- newFile = undefined
 
-getInfoNaive :: Hash -> FilePath -> IO FileInfo
+
+-- | Getting the file information corresponding to the file.
+getInfo :: FilePath -> Fiber FileInfo
+getInfo = liftIO . getInfo'
+
+getInfo' :: FilePath -> IO FileInfo
+getInfo' path = java $ do
+  file <- newFile path
+  withObject file $ do 
+    regular <- fmap not JIO.isDirectory
+    readable <- JIO.canRead
+    if (regular && readable) then do
+      lastMod <- JIO.lastModified
+      let epoch = fromIntegral $ lastMod `div` 1000
+          time  = epochTimeToHTTPDate epoch
+      size <- fmap fromIntegral $ JIO.length
+      let date = formatHTTPDate time
+      return $ FileInfo { fileInfoName = path
+                        , fileInfoSize = size
+                        , fileInfoTime = time
+                        , fileInfoDate = date }
+    else do
+      absolutePath <- file <.> JIO.getAbsolutePath
+      io $ throwIO (userError $ "File:getInfo: " ++ absolutePath)
+
+getInfoNaive :: Hash -> FilePath -> Fiber FileInfo
 getInfoNaive _ = getInfo
 
 ----------------------------------------------------------------
 
-getAndRegisterInfo :: FileInfoCache -> Hash -> FilePath -> IO FileInfo
+getAndRegisterInfo :: FileInfoCache -> Hash -> FilePath -> Fiber FileInfo
 getAndRegisterInfo reaper@Reaper{..} h path = do
-    cache <- reaperRead
+    cache <- liftIO reaperRead
     case M.lookup h path cache of
-        Just Negative     -> throwIO (userError "FileInfoCache:getAndRegisterInfo")
+        Just Negative     -> liftIO $ throwIO (userError "FileInfoCache:getAndRegisterInfo")
         Just (Positive x) -> return x
-        Nothing           -> positive reaper h path
-                               `E.onException` negative reaper h path
+        Nothing           -> liftIO (positive reaper h path
+                               `onException` negative reaper h path)
 
 positive :: FileInfoCache -> Hash -> FilePath -> IO FileInfo
 positive Reaper{..} h path = do
-    info <- getInfo path
+    info <- getInfo' path
     reaperAdd (h, path, Positive info)
     return info
 
@@ -85,12 +100,12 @@ negative Reaper{..} h path = do
 --   and executing the action in the second argument.
 --   The first argument is a cache duration in second.
 withFileInfoCache :: Int
-                  -> ((Hash -> FilePath -> IO FileInfo) -> IO a)
-                  -> IO a
+                  -> ((Hash -> FilePath -> Fiber FileInfo) -> Fiber a)
+                  -> Fiber a
 withFileInfoCache 0        action = action getInfoNaive
 withFileInfoCache duration action =
-    E.bracket (initialize duration)
-              terminate
+    FE.bracket (liftIO $ initialize duration)
+              (liftIO . terminate)
               (action . getAndRegisterInfo)
 
 initialize :: Hash -> IO FileInfoCache
@@ -108,4 +123,4 @@ override :: Cache -> IO (Cache -> Cache)
 override _ = return $ const M.empty
 
 terminate :: FileInfoCache -> IO ()
-terminate x = void $ reaperStop x
+terminate x = liftIO $ void $ reaperStop x

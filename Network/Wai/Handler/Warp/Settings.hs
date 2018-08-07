@@ -4,8 +4,10 @@
 
 module Network.Wai.Handler.Warp.Settings where
 
-import Control.Concurrent (forkIOWithUnmask)
-import Control.Exception
+-- import Control.Concurrent (forkIOWithUnmask)
+import Control.Concurrent.Fiber
+import Control.Concurrent.Fiber.Exception
+import Control.Exception (SomeException, fromException, AsyncException(..))
 import Data.ByteString.Builder (byteString)
 import qualified Data.ByteString.Char8 as C8
 import Data.Streaming.Network (HostPreference)
@@ -14,15 +16,19 @@ import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import GHC.IO.Exception (IOErrorType(..))
 import qualified Network.HTTP.Types as H
-import Network.Socket (SockAddr)
-import Network.Wai
-import qualified Paths_warp
+-- import Network.Socket (SockAddr)
+import Control.Concurrent.Fiber.Network (SockAddr)
+import Network.Wai hiding (Request, Response, responseBuilder, responseLBS)
+import Network.Wai.Handler.Warp.ResponseBuilder
+import qualified Paths_warp_fibers
 import System.IO (stderr)
 import System.IO.Error (ioeGetErrorType)
+-- import GHC.IO (unsafeUnmask)
 
 import Network.Wai.Handler.Warp.Imports
 import Network.Wai.Handler.Warp.Timeout
 import Network.Wai.Handler.Warp.Types
+import Network.Wai.Handler.Warp.ResponseBuilder
 
 -- | Various Warp server settings. This is purposely kept as an abstract data
 -- type so that new settings can be added without breaking backwards
@@ -33,20 +39,20 @@ import Network.Wai.Handler.Warp.Types
 data Settings = Settings
     { settingsPort :: Port -- ^ Port to listen on. Default value: 3000
     , settingsHost :: HostPreference -- ^ Default value: HostIPv4
-    , settingsOnException :: Maybe Request -> SomeException -> IO () -- ^ What to do with exceptions thrown by either the application or server. Default: ignore server-generated exceptions (see 'InvalidRequest') and print application-generated applications to stderr.
+    , settingsOnException :: Maybe Request -> SomeException -> Fiber () -- ^ What to do with exceptions thrown by either the application or server. Default: ignore server-generated exceptions (see 'InvalidRequest') and print application-generated applications to stderr.
     , settingsOnExceptionResponse :: SomeException -> Response
       -- ^ A function to create `Response` when an exception occurs.
       --
       -- Default: 500, text/plain, \"Something went wrong\"
       --
       -- Since 2.0.3
-    , settingsOnOpen :: SockAddr -> IO Bool -- ^ What to do when a connection is open. When 'False' is returned, the connection is closed immediately. Otherwise, the connection is going on. Default: always returns 'True'.
-    , settingsOnClose :: SockAddr -> IO ()  -- ^ What to do when a connection is close. Default: do nothing.
+    , settingsOnOpen :: SockAddr -> Fiber Bool -- ^ What to do when a connection is open. When 'False' is returned, the connection is closed immediately. Otherwise, the connection is going on. Default: always returns 'True'.
+    , settingsOnClose :: SockAddr -> Fiber ()  -- ^ What to do when a connection is close. Default: do nothing.
     , settingsTimeout :: Int -- ^ Timeout value in seconds. Default value: 30
     , settingsManager :: Maybe Manager -- ^ Use an existing timeout manager instead of spawning a new one. If used, 'settingsTimeout' is ignored. Default is 'Nothing'
     , settingsFdCacheDuration :: Int -- ^ Cache duration time of file descriptors in seconds. 0 means that the cache mechanism is not used. Default value: 0
     , settingsFileInfoCacheDuration :: Int -- ^ Cache duration time of file information in seconds. 0 means that the cache mechanism is not used. Default value: 0
-    , settingsBeforeMainLoop :: IO ()
+    , settingsBeforeMainLoop :: Fiber ()
       -- ^ Code to run after the listening socket is ready but before entering
       -- the main event loop. Useful for signaling to tests that they can start
       -- running, or to drop permissions after binding to a restricted port.
@@ -55,7 +61,7 @@ data Settings = Settings
       --
       -- Since 1.3.6
 
-    , settingsFork :: ((forall a. IO a -> IO a) -> IO ()) -> IO ()
+    , settingsFork :: ((forall a. Fiber a -> Fiber a) -> Fiber ()) -> IO ()
       -- ^ Code to fork a new thread to accept a connection.
       --
       -- This may be useful if you need OS bound threads, or if
@@ -73,7 +79,7 @@ data Settings = Settings
       -- Default: False
       --
       -- Since 2.0.3
-    , settingsInstallShutdownHandler :: IO () -> IO ()
+    , settingsInstallShutdownHandler :: Fiber () -> IO ()
     , settingsServerName :: ByteString
       -- ^ Default server name if application does not set one.
       --
@@ -94,11 +100,11 @@ data Settings = Settings
       -- ^ Whether to enable HTTP2 ALPN/upgrades. Default: True
       --
       -- Since 3.1.7.
-    , settingsLogger :: Request -> H.Status -> Maybe Integer -> IO ()
+    , settingsLogger :: Request -> H.Status -> Maybe Integer -> Fiber ()
       -- ^ A log function. Default: no action.
       --
       -- Since 3.X.X.
-    , settingsServerPushLogger :: Request -> ByteString -> Integer -> IO ()
+    , settingsServerPushLogger :: Request -> ByteString -> Integer -> Fiber ()
       -- ^ A HTTP/2 server push log function. Default: no action.
       --
       -- Since 3.X.X.
@@ -132,10 +138,10 @@ defaultSettings = Settings
     , settingsFdCacheDuration = 0
     , settingsFileInfoCacheDuration = 0
     , settingsBeforeMainLoop = return ()
-    , settingsFork = void . forkIOWithUnmask
+    , settingsFork = forkFiberWithUnmask
     , settingsNoParsePath = False
     , settingsInstallShutdownHandler = const $ return ()
-    , settingsServerName = C8.pack $ "Warp/" ++ showVersion Paths_warp.version
+    , settingsServerName = C8.pack $ "Warp/" ++ showVersion Paths_warp_fibers.version
     , settingsMaximumBodyFlush = Just 8192
     , settingsProxyProtocol = ProxyProtocolNone
     , settingsSlowlorisSize = 2048
@@ -163,10 +169,10 @@ defaultShouldDisplayException se
 --   if `defaultShouldDisplayException` returns `True`.
 --
 -- Since: 3.1.0
-defaultOnException :: Maybe Request -> SomeException -> IO ()
+defaultOnException :: Maybe Request -> SomeException -> Fiber ()
 defaultOnException _ e =
     when (defaultShouldDisplayException e)
-        $ TIO.hPutStrLn stderr $ T.pack $ show e
+        $ liftIO $ TIO.hPutStrLn stderr $ T.pack $ show e
 
 -- | Sending 400 for bad requests. Sending 500 for internal server errors.
 --
@@ -185,3 +191,6 @@ exceptionResponseForDebug e =
     responseBuilder H.internalServerError500
                     [(H.hContentType, "text/plain; charset=utf-8")]
                     $ byteString . C8.pack $ "Exception: " ++ show e
+
+forkFiberWithUnmask :: ((forall a . Fiber a -> Fiber a) -> Fiber ()) -> IO ()
+forkFiberWithUnmask f = void $ forkFiber (f unsafeUnmask)

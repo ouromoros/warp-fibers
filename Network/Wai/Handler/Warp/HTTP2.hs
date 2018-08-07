@@ -3,11 +3,13 @@
 
 module Network.Wai.Handler.Warp.HTTP2 (isHTTP2, http2) where
 
-import Control.Concurrent (forkIO, killThread)
-import qualified Control.Exception as E
+-- import Control.Concurrent (killThread)
+import Control.Concurrent.Fiber
+import qualified Control.Concurrent.Fiber.Exception as E
 import Network.HTTP2
-import Network.Socket (SockAddr)
-import Network.Wai
+-- import Network.Socket (SockAddr)
+import Control.Concurrent.Fiber.Network (SockAddr)
+import Network.Wai hiding (Application)
 
 import Network.Wai.Handler.Warp.HTTP2.EncodeFrame
 import Network.Wai.Handler.Warp.HTTP2.Manager
@@ -22,7 +24,7 @@ import Network.Wai.Handler.Warp.Types
 
 ----------------------------------------------------------------
 
-http2 :: Connection -> InternalInfo1 -> SockAddr -> Transport -> S.Settings -> (BufSize -> IO ByteString) -> Application -> IO ()
+http2 :: Connection -> InternalInfo1 -> SockAddr -> Transport -> S.Settings -> (BufSize -> Fiber ByteString) -> Application -> Fiber ()
 http2 conn ii1 addr transport settings readN app = do
     checkTLS
     ok <- checkPreface
@@ -41,14 +43,14 @@ http2 conn ii1 addr transport settings readN app = do
         replicateM_ 3 $ spawnAction mgr
         -- Receiver
         let mkreq = mkRequest ii1 settings addr
-        tid <- forkIO $ frameReceiver ctx mkreq readN
+        tid <- forkFiber $ frameReceiver ctx mkreq readN
         -- Sender
         -- frameSender is the main thread because it ensures to send
         -- a goway frame.
-        frameSender ctx conn settings mgr `E.finally` do
+        (frameSender ctx conn settings mgr) `E.finally` (do
             clearContext ctx
             stop mgr
-            killThread tid
+            killFiber tid)
   where
     checkTLS = case transport of
         TCP -> return () -- direct
@@ -63,7 +65,7 @@ http2 conn ii1 addr transport settings readN app = do
             return True
 
 -- connClose must not be called here since Run:fork calls it
-goaway :: Connection -> ErrorCodeId -> ByteString -> IO ()
+goaway :: Connection -> ErrorCodeId -> ByteString -> Fiber ()
 goaway Connection{..} etype debugmsg = connSendAll bytestream
   where
     bytestream = goawayFrame 0 etype debugmsg

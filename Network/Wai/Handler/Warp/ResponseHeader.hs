@@ -10,13 +10,13 @@ import Foreign.Ptr
 import GHC.Storable
 import qualified Network.HTTP.Types as H
 
-import Network.Wai.Handler.Warp.Buffer (copy)
+import Network.Wai.Handler.Warp.Buffer (copy, copy')
 import Network.Wai.Handler.Warp.Imports
 
 ----------------------------------------------------------------
 
-composeHeader :: H.HttpVersion -> H.Status -> H.ResponseHeaders -> IO ByteString
-composeHeader !httpversion !status !responseHeaders = create len $ \ptr -> do
+composeHeader :: H.HttpVersion -> H.Status -> H.ResponseHeaders -> Fiber ByteString
+composeHeader !httpversion !status !responseHeaders = liftIO $ create len $ \ptr -> do
     ptr1 <- copyStatus ptr httpversion status
     ptr2 <- copyHeaders ptr1 responseHeaders
     void $ copyCRLF ptr2
@@ -34,12 +34,12 @@ httpVer10 = "HTTP/1.0 "
 {-# INLINE copyStatus #-}
 copyStatus :: Ptr Word8 -> H.HttpVersion -> H.Status -> IO (Ptr Word8)
 copyStatus !ptr !httpversion !status = do
-    ptr1 <- copy ptr httpVer
+    ptr1 <- copy' ptr httpVer
     writeWord8OffPtr ptr1 0 (zero + fromIntegral r2)
     writeWord8OffPtr ptr1 1 (zero + fromIntegral r1)
     writeWord8OffPtr ptr1 2 (zero + fromIntegral r0)
     writeWord8OffPtr ptr1 3 spc
-    ptr2 <- copy (ptr1 `plusPtr` 4) (H.statusMessage status)
+    ptr2 <- copy' (ptr1 `plusPtr` 4) (H.statusMessage status)
     copyCRLF ptr2
   where
     httpVer
@@ -59,10 +59,10 @@ copyHeaders !ptr (h:hs) = do
 {-# INLINE copyHeader #-}
 copyHeader :: Ptr Word8 -> H.Header -> IO (Ptr Word8)
 copyHeader !ptr (k,v) = do
-    ptr1 <- copy ptr (CI.original k)
+    ptr1 <- copy' ptr (CI.original k)
     writeWord8OffPtr ptr1 0 colon
     writeWord8OffPtr ptr1 1 spc
-    ptr2 <- copy (ptr1 `plusPtr` 2) v
+    ptr2 <- copy' (ptr1 `plusPtr` 2) v
     copyCRLF ptr2
 
 {-# INLINE copyCRLF #-}
